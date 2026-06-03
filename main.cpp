@@ -1,5 +1,6 @@
 #define WLR_USE_UNSTABLE
 
+#include <algorithm>
 #include <format>
 #include <stdexcept>
 #include <string>
@@ -9,16 +10,27 @@
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/helpers/Monitor.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
+#include <hyprland/src/render/OpenGL.hpp>
+#include <hyprland/src/render/Renderer.hpp>
 
 static HANDLE         g_pluginHandle             = nullptr;
 static CFunctionHook* g_needsUnmodifiedCopyHook  = nullptr;
+static CFunctionHook* g_saveBufferForMirrorHook  = nullptr;
+static CFunctionHook* g_renderMonitorHook        = nullptr;
 static bool           g_disableUnmodifiedCopyMRT = true;
+static SP<CShader>     g_captureShader;
 
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
     return HYPRLAND_API_VERSION;
 }
 
 typedef bool (*origNeedsUnmodifiedCopy)(void*);
+typedef void (*origSaveBufferForMirror)(void*, const CBox&);
+typedef void (*origRenderMonitor)(void*);
+
+static constexpr float CAPTURE_EXPOSURE_AT_REF_LUMINANCE = 0.78125F;
+static constexpr float CAPTURE_REFERENCE_LUMINANCE       = 80.0F;
+static constexpr float CAPTURE_SATURATION                = 0.86F;
 
 static void scheduleRefreshForAllMonitors() {
     if (!g_pCompositor)
@@ -38,6 +50,142 @@ static bool hkNeedsUnmodifiedCopy(void* thisptr) {
         return false;
 
     return ((origNeedsUnmodifiedCopy)g_needsUnmodifiedCopyHook->m_original)(thisptr);
+}
+
+static NColorManagement::PImageDescription captureImageDescription() {
+    return NColorManagement::DEFAULT_SRGB_IMAGE_DESCRIPTION;
+}
+
+static bool ensureCaptureShader() {
+    if (g_captureShader)
+        return true;
+
+    if (!Render::GL::g_pHyprOpenGL || !Render::GL::g_pHyprOpenGL->m_shadersInitialized || !Render::GL::g_pHyprOpenGL->m_shaders)
+        return false;
+
+    static const std::string FRAG = R"SHADER(
+#version 300 es
+precision highp float;
+in vec2 v_texcoord;
+uniform sampler2D tex;
+uniform float exposure;
+uniform float saturation;
+layout(location = 0) out vec4 fragColor;
+
+vec3 acesApprox(vec3 v) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((v * (a * v + b)) / (v * (c * v + d) + e), 0.0, 1.0);
+}
+
+vec3 linearToSrgb(vec3 v) {
+    bvec3 cutoff = lessThanEqual(v, vec3(0.0031308));
+    vec3  lower  = v * 12.92;
+    vec3  higher = 1.055 * pow(max(v, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(higher, lower, cutoff);
+}
+
+void main() {
+    vec4 src = texture(tex, v_texcoord);
+    vec3 rgb = max(src.rgb, vec3(0.0)) * exposure;
+    rgb      = acesApprox(rgb);
+
+    float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    rgb        = mix(vec3(luma), rgb, saturation);
+    rgb        = linearToSrgb(clamp(rgb, 0.0, 1.0));
+
+    fragColor = vec4(rgb, 1.0);
+}
+)SHADER";
+
+    g_captureShader = makeShared<CShader>();
+    if (!g_captureShader->createProgram(Render::GL::g_pHyprOpenGL->m_shaders->TEXVERTSRC, FRAG, true, true)) {
+        g_captureShader.reset();
+        return false;
+    }
+
+    return true;
+}
+
+static bool renderCaptureShader(const SP<Render::ITexture>& sourceTex, const SP<Render::IFramebuffer>& mirrorFB, const CBox& box, const float exposure) {
+    if (!sourceTex || !mirrorFB || !ensureCaptureShader())
+        return false;
+
+    auto guard = g_pHyprRenderer->bindTempFB(mirrorFB);
+
+    Render::GL::g_pHyprOpenGL->blend(false);
+
+    const auto& glMatrix = g_pHyprRenderer->projectBoxToTarget(box);
+
+    glActiveTexture(GL_TEXTURE0);
+    sourceTex->bind();
+    sourceTex->setTexParameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    sourceTex->setTexParameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    sourceTex->setTexParameter(GL_TEXTURE_MAG_FILTER, sourceTex->magFilter);
+    sourceTex->setTexParameter(GL_TEXTURE_MIN_FILTER, sourceTex->minFilter);
+
+    auto shader = Render::GL::g_pHyprOpenGL->useShader(g_captureShader);
+    shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, glMatrix.getMatrix());
+    shader->setUniformInt(SHADER_TEX, 0);
+    glUniform1f(glGetUniformLocation(shader->program(), "exposure"), exposure);
+    glUniform1f(glGetUniformLocation(shader->program(), "saturation"), CAPTURE_SATURATION);
+
+    glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
+    glBindBuffer(GL_ARRAY_BUFFER, shader->getUniformLocation(SHADER_SHADER_VBO));
+    glBufferData(GL_ARRAY_BUFFER, sizeof(Render::GL::fullVerts), nullptr, GL_DYNAMIC_DRAW);
+
+    auto verts = Render::GL::fullVerts;
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts.data());
+
+    g_pHyprRenderer->m_renderData.finalDamage.forEachRect([](const auto& rect) {
+        Render::GL::g_pHyprOpenGL->scissor(&rect, g_pHyprRenderer->m_renderData.transformDamage);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    });
+
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    sourceTex->unbind();
+    Render::GL::g_pHyprOpenGL->scissor(nullptr);
+    Render::GL::g_pHyprOpenGL->blend(true);
+
+    return true;
+}
+
+static void hkSaveBufferForMirror(void* thisptr, const CBox& box) {
+    const auto monitorRef = g_pHyprRenderer ? g_pHyprRenderer->m_renderData.pMonitor : PHLMONITORREF{};
+    const auto monitor    = monitorRef ? monitorRef.lock() : PHLMONITOR{};
+
+    const auto sourceTex = g_pHyprRenderer && g_pHyprRenderer->m_renderData.currentFB ? g_pHyprRenderer->m_renderData.currentFB->getTexture() : nullptr;
+    const auto mirrorFB  = monitor && monitor->resources() ? monitor->resources()->mirrorFB() : nullptr;
+
+    if (mirrorFB)
+        mirrorFB->setImageDescription(captureImageDescription());
+
+    const float exposure = monitor ? CAPTURE_EXPOSURE_AT_REF_LUMINANCE * CAPTURE_REFERENCE_LUMINANCE / std::max<float>(1.0F, monitor->m_sdrMaxLuminance) :
+                                   CAPTURE_EXPOSURE_AT_REF_LUMINANCE;
+
+    if (renderCaptureShader(sourceTex, mirrorFB, box, exposure))
+        return;
+
+    ((origSaveBufferForMirror)g_saveBufferForMirrorHook->m_original)(thisptr, box);
+}
+
+static void hkRenderMonitor(void* thisptr) {
+    const auto currentFB = g_pHyprRenderer ? g_pHyprRenderer->m_renderData.currentFB : nullptr;
+
+    NColorManagement::PImageDescription originalTargetDesc;
+    if (currentFB) {
+        originalTargetDesc = currentFB->imageDescription();
+        currentFB->setImageDescription(captureImageDescription());
+    }
+
+    ((origRenderMonitor)g_renderMonitorHook->m_original)(thisptr);
+
+    if (currentFB && originalTargetDesc)
+        currentFB->setImageDescription(originalTargetDesc);
 }
 
 static void* findFnOrThrow(const std::string& name, std::initializer_list<std::string_view> demangledNeedles) {
@@ -70,7 +218,6 @@ static void* findFnOrThrow(const std::string& name, std::initializer_list<std::s
 
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pluginHandle = handle;
-
     const std::string HASH        = __hyprland_api_get_hash();
     const std::string CLIENT_HASH = __hyprland_api_get_client_hash();
 
@@ -86,9 +233,25 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!g_needsUnmodifiedCopyHook || !g_needsUnmodifiedCopyHook->hook())
         throw std::runtime_error("[fix-hdr-screenshare] Failed to hook CMonitor::needsUnmodifiedCopy");
 
+    g_saveBufferForMirrorHook = HyprlandAPI::createFunctionHook(
+        g_pluginHandle,
+        findFnOrThrow("saveBufferForMirror", {"CHyprOpenGLImpl::saveBufferForMirror("}),
+        (void*)hkSaveBufferForMirror);
+
+    if (!g_saveBufferForMirrorHook || !g_saveBufferForMirrorHook->hook())
+        throw std::runtime_error("[fix-hdr-screenshare] Failed to hook CHyprOpenGLImpl::saveBufferForMirror");
+
+    g_renderMonitorHook = HyprlandAPI::createFunctionHook(
+        g_pluginHandle,
+        findFnOrThrow("renderMonitor", {"CScreenshareFrame::renderMonitor("}),
+        (void*)hkRenderMonitor);
+
+    if (!g_renderMonitorHook || !g_renderMonitorHook->hook())
+        throw std::runtime_error("[fix-hdr-screenshare] Failed to hook CScreenshareFrame::renderMonitor");
+
     scheduleRefreshForAllMonitors();
 
-    return {"fix-hdr-screenshare", "Disable the HDR unmodified-copy MRT path used for screenshare", "daniel", "0.2"};
+    return {"fix-hdr-screenshare", "Disable the HDR unmodified-copy MRT path used for screenshare", "daniel", "0.4"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -99,6 +262,20 @@ APICALL EXPORT void PLUGIN_EXIT() {
         HyprlandAPI::removeFunctionHook(g_pluginHandle, g_needsUnmodifiedCopyHook);
         g_needsUnmodifiedCopyHook = nullptr;
     }
+
+    if (g_saveBufferForMirrorHook) {
+        g_saveBufferForMirrorHook->unhook();
+        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_saveBufferForMirrorHook);
+        g_saveBufferForMirrorHook = nullptr;
+    }
+
+    if (g_renderMonitorHook) {
+        g_renderMonitorHook->unhook();
+        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_renderMonitorHook);
+        g_renderMonitorHook = nullptr;
+    }
+
+    g_captureShader.reset();
 
     scheduleRefreshForAllMonitors();
 }
