@@ -16,7 +16,6 @@
 static HANDLE         g_pluginHandle             = nullptr;
 static CFunctionHook* g_needsUnmodifiedCopyHook  = nullptr;
 static CFunctionHook* g_saveBufferForMirrorHook  = nullptr;
-static CFunctionHook* g_renderMonitorHook        = nullptr;
 static bool           g_disableUnmodifiedCopyMRT = true;
 static SP<CShader>     g_captureShader;
 
@@ -26,11 +25,11 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
 
 typedef bool (*origNeedsUnmodifiedCopy)(void*);
 typedef void (*origSaveBufferForMirror)(void*, const CBox&);
-typedef void (*origRenderMonitor)(void*);
 
 static constexpr float CAPTURE_EXPOSURE_AT_REF_LUMINANCE = 0.78125F;
 static constexpr float CAPTURE_REFERENCE_LUMINANCE       = 80.0F;
 static constexpr float CAPTURE_SATURATION                = 0.86F;
+static constexpr float CAPTURE_DEFAULT_MIN_LUMINANCE      = 0.2F;
 
 static void scheduleRefreshForAllMonitors() {
     if (!g_pCompositor)
@@ -70,6 +69,9 @@ in vec2 v_texcoord;
 uniform sampler2D tex;
 uniform float exposure;
 uniform float saturation;
+uniform float blackLift;
+uniform float inverseSdrBrightness;
+uniform float inverseSdrSaturation;
 layout(location = 0) out vec4 fragColor;
 
 vec3 acesApprox(vec3 v) {
@@ -88,14 +90,28 @@ vec3 linearToSrgb(vec3 v) {
     return mix(higher, lower, cutoff);
 }
 
+vec3 applySaturation(vec3 color, float saturation) {
+    float y = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    return mix(vec3(y), color, saturation);
+}
+
 void main() {
     vec4 src = texture(tex, v_texcoord);
-    vec3 rgb = max(src.rgb, vec3(0.0)) * exposure;
-    rgb      = acesApprox(rgb);
+    vec3 rgb = max(src.rgb, vec3(0.0));
+
+    rgb *= inverseSdrBrightness;
+    rgb = applySaturation(rgb, inverseSdrSaturation);
+
+    rgb *= exposure;
+    rgb = acesApprox(rgb);
 
     float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
     rgb        = mix(vec3(luma), rgb, saturation);
-    rgb        = linearToSrgb(clamp(rgb, 0.0, 1.0));
+
+    float shadowMask = 1.0 - smoothstep(0.0, 0.25, max(max(rgb.r, rgb.g), rgb.b));
+    rgb += vec3(blackLift) * shadowMask;
+
+    rgb = linearToSrgb(clamp(rgb, 0.0, 1.0));
 
     fragColor = vec4(rgb, 1.0);
 }
@@ -110,7 +126,7 @@ void main() {
     return true;
 }
 
-static bool renderCaptureShader(const SP<Render::ITexture>& sourceTex, const SP<Render::IFramebuffer>& mirrorFB, const CBox& box, const float exposure) {
+static bool renderCaptureShader(const SP<Render::ITexture>& sourceTex, const SP<Render::IFramebuffer>& mirrorFB, const CBox& box, const float exposure, const float blackLift, const float inverseSdrBrightness, const float inverseSdrSaturation) {
     if (!sourceTex || !mirrorFB || !ensureCaptureShader())
         return false;
 
@@ -132,6 +148,9 @@ static bool renderCaptureShader(const SP<Render::ITexture>& sourceTex, const SP<
     shader->setUniformInt(SHADER_TEX, 0);
     glUniform1f(glGetUniformLocation(shader->program(), "exposure"), exposure);
     glUniform1f(glGetUniformLocation(shader->program(), "saturation"), CAPTURE_SATURATION);
+    glUniform1f(glGetUniformLocation(shader->program(), "blackLift"), blackLift);
+    glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrBrightness"), inverseSdrBrightness);
+    glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrSaturation"), inverseSdrSaturation);
 
     glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
     glBindBuffer(GL_ARRAY_BUFFER, shader->getUniformLocation(SHADER_SHADER_VBO));
@@ -164,28 +183,17 @@ static void hkSaveBufferForMirror(void* thisptr, const CBox& box) {
     if (mirrorFB)
         mirrorFB->setImageDescription(captureImageDescription());
 
-    const float exposure = monitor ? CAPTURE_EXPOSURE_AT_REF_LUMINANCE * CAPTURE_REFERENCE_LUMINANCE / std::max<float>(1.0F, monitor->m_sdrMaxLuminance) :
-                                   CAPTURE_EXPOSURE_AT_REF_LUMINANCE;
+    const float sdrMaxLuminance = monitor ? std::max<float>(1.0F, monitor->m_sdrMaxLuminance) : CAPTURE_REFERENCE_LUMINANCE;
+    const float sdrMinLuminance = monitor ? std::max<float>(0.0F, monitor->m_sdrMinLuminance) : CAPTURE_DEFAULT_MIN_LUMINANCE;
+    const float exposure             = CAPTURE_EXPOSURE_AT_REF_LUMINANCE * CAPTURE_REFERENCE_LUMINANCE / sdrMaxLuminance;
+    const float blackLift            = sdrMinLuminance / CAPTURE_REFERENCE_LUMINANCE;
+    const float inverseSdrBrightness = monitor && monitor->m_sdrBrightness > 0.0F ? 1.0F / monitor->m_sdrBrightness : 1.0F;
+    const float inverseSdrSaturation = monitor && monitor->m_sdrSaturation > 0.0F ? 1.0F / monitor->m_sdrSaturation : 1.0F;
 
-    if (renderCaptureShader(sourceTex, mirrorFB, box, exposure))
+    if (renderCaptureShader(sourceTex, mirrorFB, box, exposure, blackLift, inverseSdrBrightness, inverseSdrSaturation))
         return;
 
     ((origSaveBufferForMirror)g_saveBufferForMirrorHook->m_original)(thisptr, box);
-}
-
-static void hkRenderMonitor(void* thisptr) {
-    const auto currentFB = g_pHyprRenderer ? g_pHyprRenderer->m_renderData.currentFB : nullptr;
-
-    NColorManagement::PImageDescription originalTargetDesc;
-    if (currentFB) {
-        originalTargetDesc = currentFB->imageDescription();
-        currentFB->setImageDescription(captureImageDescription());
-    }
-
-    ((origRenderMonitor)g_renderMonitorHook->m_original)(thisptr);
-
-    if (currentFB && originalTargetDesc)
-        currentFB->setImageDescription(originalTargetDesc);
 }
 
 static void* findFnOrThrow(const std::string& name, std::initializer_list<std::string_view> demangledNeedles) {
@@ -241,14 +249,6 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!g_saveBufferForMirrorHook || !g_saveBufferForMirrorHook->hook())
         throw std::runtime_error("[fix-hdr-screenshare] Failed to hook CHyprOpenGLImpl::saveBufferForMirror");
 
-    g_renderMonitorHook = HyprlandAPI::createFunctionHook(
-        g_pluginHandle,
-        findFnOrThrow("renderMonitor", {"CScreenshareFrame::renderMonitor("}),
-        (void*)hkRenderMonitor);
-
-    if (!g_renderMonitorHook || !g_renderMonitorHook->hook())
-        throw std::runtime_error("[fix-hdr-screenshare] Failed to hook CScreenshareFrame::renderMonitor");
-
     scheduleRefreshForAllMonitors();
 
     return {"fix-hdr-screenshare", "Disable the HDR unmodified-copy MRT path used for screenshare", "daniel", "0.4"};
@@ -267,12 +267,6 @@ APICALL EXPORT void PLUGIN_EXIT() {
         g_saveBufferForMirrorHook->unhook();
         HyprlandAPI::removeFunctionHook(g_pluginHandle, g_saveBufferForMirrorHook);
         g_saveBufferForMirrorHook = nullptr;
-    }
-
-    if (g_renderMonitorHook) {
-        g_renderMonitorHook->unhook();
-        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_renderMonitorHook);
-        g_renderMonitorHook = nullptr;
     }
 
     g_captureShader.reset();
