@@ -45,7 +45,9 @@ static void scheduleRefreshForAllMonitors() {
 }
 
 static bool hkNeedsUnmodifiedCopy(void* thisptr) {
-    if (g_disableUnmodifiedCopyMRT)
+    const auto monitor = static_cast<CMonitor*>(thisptr);
+
+    if (g_disableUnmodifiedCopyMRT && monitor && monitor->inHDR())
         return false;
 
     return ((origNeedsUnmodifiedCopy)g_needsUnmodifiedCopyHook->m_original)(thisptr);
@@ -176,6 +178,11 @@ static bool renderCaptureShader(const SP<Render::ITexture>& sourceTex, const SP<
 static void hkSaveBufferForMirror(void* thisptr, const CBox& box) {
     const auto monitorRef = g_pHyprRenderer ? g_pHyprRenderer->m_renderData.pMonitor : PHLMONITORREF{};
     const auto monitor    = monitorRef ? monitorRef.lock() : PHLMONITOR{};
+
+    if (!monitor || !monitor->inHDR()) {
+        ((origSaveBufferForMirror)g_saveBufferForMirrorHook->m_original)(thisptr, box);
+        return;
+    }
 
     const auto sourceTex = g_pHyprRenderer && g_pHyprRenderer->m_renderData.currentFB ? g_pHyprRenderer->m_renderData.currentFB->getTexture() : nullptr;
     const auto mirrorFB  = monitor && monitor->resources() ? monitor->resources()->mirrorFB() : nullptr;
