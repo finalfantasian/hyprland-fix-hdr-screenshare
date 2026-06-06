@@ -4,17 +4,21 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <format>
 #include <functional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include <aquamarine/buffer/Buffer.hpp>
 #include <hyprland/src/Compositor.hpp>
+#include <hyprland/src/debug/log/Logger.hpp>
+#include <hyprland/src/desktop/view/WLSurface.hpp>
 #include <hyprland/src/helpers/Monitor.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/render/Renderbuffer.hpp>
@@ -27,8 +31,15 @@ static CFunctionHook* g_saveBufferForMirrorHook  = nullptr;
 static CFunctionHook* g_getOrCreateRBHook        = nullptr;
 static CFunctionHook* g_blurFramebufferHook      = nullptr;
 static CFunctionHook* g_renderTextureHook        = nullptr;
+static CFunctionHook* g_preDrawSurfaceHook       = nullptr;
+static CFunctionHook* g_getShaderVariantHook     = nullptr;
 static bool           g_disableUnmodifiedCopyMRT = true;
 static SP<CShader>     g_captureShader;
+static std::unordered_set<uintptr_t> g_alphaCorrectionTextures;
+static std::unordered_map<Render::ShaderFeatureFlags, SP<CShader>> g_alphaCorrectionSurfaceShaders;
+static bool           g_correctSurfaceAlphaShader = false;
+static std::unordered_map<uintptr_t, CTimer> g_surfaceDebugTimers;
+static constexpr const char*                 SURFACE_DEBUG_LOG = "/tmp/fix-hdr-screenshare-alpha.log";
 
 struct SDMABUFImportKey {
     uintptr_t               buffer = 0;
@@ -81,11 +92,14 @@ typedef void (*origSaveBufferForMirror)(void*, const CBox&);
 typedef SP<Render::IRenderbuffer> (*origGetOrCreateRenderbuffer)(void*, SP<Aquamarine::IBuffer>, uint32_t);
 typedef SP<Render::ITexture> (*origBlurFramebuffer)(void*, SP<Render::IFramebuffer>, float, CRegion*);
 typedef void (*origRenderTextureInternal)(void*, SP<Render::ITexture>, const CBox&, const Render::GL::CHyprOpenGLImpl::STextureRenderData&);
+typedef void (*origPreDrawSurface)(void*, WP<CSurfacePassElement>, const CRegion&);
+typedef WP<CShader> (*origGetShaderVariant)(void*, Render::ePreparedFragmentShader, Render::ShaderFeatureFlags);
 
 static constexpr float CAPTURE_EXPOSURE_AT_REF_LUMINANCE = 0.78125F;
 static constexpr float CAPTURE_REFERENCE_LUMINANCE       = 80.0F;
 static constexpr float CAPTURE_SATURATION                = 0.86F;
 static constexpr float CAPTURE_DEFAULT_MIN_LUMINANCE      = 0.2F;
+static constexpr float HDR_ALPHA_CORRECTION_EXPONENT      = 1.5F;
 
 static void scheduleRefreshForAllMonitors() {
     if (!g_pCompositor)
@@ -175,6 +189,24 @@ static PHLMONITOR currentMonitor() {
     return monitorRef ? monitorRef.lock() : PHLMONITOR{};
 }
 
+static float correctHDRAlpha(float alpha) {
+    alpha = std::clamp(alpha, 0.0F, 1.0F);
+    if (alpha <= 0.0F || alpha >= 1.0F)
+        return alpha;
+
+    return 1.0F - std::pow(1.0F - alpha, HDR_ALPHA_CORRECTION_EXPONENT);
+}
+
+static void appendSurfaceDebugLog(const std::string& line) {
+    FILE* file = std::fopen(SURFACE_DEBUG_LOG, "a");
+    if (!file)
+        return;
+
+    std::fputs(line.c_str(), file);
+    std::fputc('\n', file);
+    std::fclose(file);
+}
+
 static SP<Render::ITexture> hkBlurFramebuffer(void* thisptr, SP<Render::IFramebuffer> source, float a, CRegion* originalDamage) {
     auto tex = currentMonitorInHDR() ? renderSDRBlurFromHDRSource(source, a, originalDamage) : nullptr;
     if (!tex)
@@ -186,16 +218,99 @@ static SP<Render::ITexture> hkBlurFramebuffer(void* thisptr, SP<Render::IFramebu
     return tex;
 }
 
+static void hkPreDrawSurface(void* thisptr, WP<CSurfacePassElement> element, const CRegion& damage) {
+    const auto monitor = currentMonitor();
+    if (!monitor || !monitor->inHDR() || !element) {
+        ((origPreDrawSurface)g_preDrawSurfaceHook->m_original)(thisptr, element, damage);
+        return;
+    }
+
+    auto surface = Desktop::View::CWLSurface::fromResource(element->m_data.surface);
+    const float alphaModifier = surface ? surface->m_alphaModifier : 1.0F;
+    const float overallOpacity = surface ? surface->m_overallOpacity : 1.0F;
+    const float totalAlpha = element->m_data.alpha * element->m_data.fadeAlpha * alphaModifier * overallOpacity;
+    const float correctedTotalAlpha = correctHDRAlpha(totalAlpha);
+    const auto  tex = element->m_data.texture;
+
+    if (tex && (totalAlpha < 0.999F || tex->m_type == Render::TEXTURE_RGBA || !tex->m_opaque)) {
+        const auto key = reinterpret_cast<uintptr_t>(element->m_data.surface.get());
+        auto&      timer = g_surfaceDebugTimers[key];
+
+        if (timer.getSeconds() >= 1.0) {
+            timer.reset();
+            const auto window = element->m_data.pWindow;
+            const auto cls    = window ? window->m_class : std::string{"<no-window>"};
+            const auto title  = window ? window->m_title : std::string{"<no-title>"};
+
+            appendSurfaceDebugLog(std::format(
+                "class='{}' title='{}' alpha={} fade={} alphaModifier={} overallOpacity={} total={} corrected={} texType={} texOpaque={} surface={:x}",
+                cls, title, element->m_data.alpha, element->m_data.fadeAlpha, alphaModifier, overallOpacity, totalAlpha, correctedTotalAlpha, sc<int>(tex->m_type),
+                tex->m_opaque, key));
+        }
+    }
+
+    const float originalAlpha = element->m_data.alpha;
+    const bool  correctTextureAlpha = tex && tex->m_type == Render::TEXTURE_RGBA && !tex->m_opaque && totalAlpha >= 0.999F;
+    const auto  textureKey = correctTextureAlpha ? reinterpret_cast<uintptr_t>(tex.get()) : 0;
+
+    if (correctTextureAlpha)
+        g_alphaCorrectionTextures.emplace(textureKey);
+
+    if (totalAlpha > 0.0F && totalAlpha < 1.0F)
+        element->m_data.alpha *= correctedTotalAlpha / totalAlpha;
+
+    ((origPreDrawSurface)g_preDrawSurfaceHook->m_original)(thisptr, element, damage);
+
+    if (correctTextureAlpha)
+        g_alphaCorrectionTextures.erase(textureKey);
+
+    element->m_data.alpha = originalAlpha;
+}
+
+static WP<CShader> hkGetShaderVariant(void* thisptr, Render::ePreparedFragmentShader frag, Render::ShaderFeatureFlags features) {
+    if (!g_correctSurfaceAlphaShader || frag != Render::SH_FRAG_SURFACE || !(features & Render::SH_FEAT_RGBA) || !Render::g_pShaderLoader ||
+        !Render::GL::g_pHyprOpenGL || !Render::GL::g_pHyprOpenGL->m_shaders) {
+        return ((origGetShaderVariant)g_getShaderVariantHook->m_original)(thisptr, frag, features);
+    }
+
+    if (auto it = g_alphaCorrectionSurfaceShaders.find(features); it != g_alphaCorrectionSurfaceShaders.end())
+        return it->second;
+
+    auto source = Render::g_pShaderLoader->getVariantSource(frag, features);
+
+    static constexpr std::string_view NEEDLE = "vec4 pixColor = texture(tex, v_texcoord);";
+    const auto                        pos    = source.find(NEEDLE);
+    if (pos == std::string::npos)
+        return ((origGetShaderVariant)g_getShaderVariantHook->m_original)(thisptr, frag, features);
+
+    const auto replacement = std::format(R"SHADER(vec4 pixColor = texture(tex, v_texcoord);
+    if (pixColor.a > 0.0 && pixColor.a < 1.0)
+        pixColor.a = 1.0 - pow(1.0 - pixColor.a, {:.8f});)SHADER",
+                                         HDR_ALPHA_CORRECTION_EXPONENT);
+    source.replace(pos, NEEDLE.size(), replacement);
+
+    auto shader = makeShared<CShader>();
+    if (!shader->createProgram(Render::GL::g_pHyprOpenGL->m_shaders->TEXVERTSRC, source, true, true))
+        return ((origGetShaderVariant)g_getShaderVariantHook->m_original)(thisptr, frag, features);
+
+    g_alphaCorrectionSurfaceShaders.emplace(features, shader);
+    return shader;
+}
+
 static void hkRenderTextureInternal(void* thisptr, SP<Render::ITexture> tex, const CBox& box, const Render::GL::CHyprOpenGLImpl::STextureRenderData& data) {
     const auto key          = reinterpret_cast<uintptr_t>(tex.get());
     const auto monitor      = currentMonitor();
     const bool relabelBlur  = monitor && monitor->inHDR() && tex && g_srgbBlurTextures.contains(key);
     const auto originalDesc = relabelBlur ? tex->m_imageDescription : NColorManagement::PImageDescription{};
+    const bool correctAlpha = monitor && monitor->inHDR() && !relabelBlur && g_alphaCorrectionTextures.contains(key);
+    const bool previousCorrectSurfaceAlphaShader = g_correctSurfaceAlphaShader;
 
     if (relabelBlur)
         tex->m_imageDescription = NColorManagement::DEFAULT_SRGB_IMAGE_DESCRIPTION;
 
+    g_correctSurfaceAlphaShader = correctAlpha;
     ((origRenderTextureInternal)g_renderTextureHook->m_original)(thisptr, tex, box, data);
+    g_correctSurfaceAlphaShader = previousCorrectSurfaceAlphaShader;
 
     if (relabelBlur) {
         tex->m_imageDescription = originalDesc;
@@ -624,6 +739,22 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!g_renderTextureHook || !g_renderTextureHook->hook())
         throw std::runtime_error("[fix-hdr-screenshare] Failed to hook CHyprOpenGLImpl::renderTextureInternal");
 
+    g_getShaderVariantHook = HyprlandAPI::createFunctionHook(
+        g_pluginHandle,
+        findFnOrThrow("getShaderVariant", {"CHyprOpenGLImpl::getShaderVariant("}),
+        (void*)hkGetShaderVariant);
+
+    if (!g_getShaderVariantHook || !g_getShaderVariantHook->hook())
+        throw std::runtime_error("[fix-hdr-screenshare] Failed to hook CHyprOpenGLImpl::getShaderVariant");
+
+    g_preDrawSurfaceHook = HyprlandAPI::createFunctionHook(
+        g_pluginHandle,
+        findFnOrThrow("preDrawSurface", {"Render::IElementRenderer::preDrawSurface("}),
+        (void*)hkPreDrawSurface);
+
+    if (!g_preDrawSurfaceHook || !g_preDrawSurfaceHook->hook())
+        throw std::runtime_error("[fix-hdr-screenshare] Failed to hook Render::IElementRenderer::preDrawSurface");
+
     scheduleRefreshForAllMonitors();
 
     return {"fix-hdr-screenshare", "Disable the HDR unmodified-copy MRT path used for screenshare", "daniel", "0.4"};
@@ -662,9 +793,25 @@ APICALL EXPORT void PLUGIN_EXIT() {
         g_renderTextureHook = nullptr;
     }
 
+    if (g_preDrawSurfaceHook) {
+        g_preDrawSurfaceHook->unhook();
+        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_preDrawSurfaceHook);
+        g_preDrawSurfaceHook = nullptr;
+    }
+
+    if (g_getShaderVariantHook) {
+        g_getShaderVariantHook->unhook();
+        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_getShaderVariantHook);
+        g_getShaderVariantHook = nullptr;
+    }
+
     g_importableDMABUFs.clear();
     g_srgbBlurTextures.clear();
+    g_alphaCorrectionTextures.clear();
+    g_alphaCorrectionSurfaceShaders.clear();
+    g_surfaceDebugTimers.clear();
     g_captureShader.reset();
+    g_correctSurfaceAlphaShader = false;
 
     scheduleRefreshForAllMonitors();
 }
