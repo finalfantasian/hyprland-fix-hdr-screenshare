@@ -3,7 +3,7 @@ name = "hyprland-fix-hdr-screenshare"
 authors = ["daniel"]
 commit_pins = [
     # Hyprland                                  hyprland-fix-hdr-screenshare
-    ["af923e30d1d24f1f4a4f5cb8308065173c1d9539", "87d24e72ad9a5fb12fd91d799d3f2301b195c82f"], # v0.55.0
+    ["af923e30d1d24f1f4a4f5cb8308065173c1d9539", "308ab8d29e232a5b56654b9937f207af392800e5"], # v0.55.0
 ]
 
 [hyprland]
