@@ -1,23 +1,72 @@
 #define WLR_USE_UNSTABLE
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <format>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <unordered_set>
 #include <vector>
 
+#include <aquamarine/buffer/Buffer.hpp>
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/helpers/Monitor.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
+#include <hyprland/src/render/Renderbuffer.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 
 static HANDLE         g_pluginHandle             = nullptr;
 static CFunctionHook* g_needsUnmodifiedCopyHook  = nullptr;
 static CFunctionHook* g_saveBufferForMirrorHook  = nullptr;
+static CFunctionHook* g_getOrCreateRBHook        = nullptr;
 static bool           g_disableUnmodifiedCopyMRT = true;
 static SP<CShader>     g_captureShader;
+
+struct SDMABUFImportKey {
+    uintptr_t               buffer = 0;
+    int                     width = 0;
+    int                     height = 0;
+    uint32_t                format = 0;
+    uint64_t                modifier = 0;
+    int                     planes = 0;
+    std::array<uint32_t, 4> offsets = {0};
+    std::array<uint32_t, 4> strides = {0};
+    std::array<int, 4>      fds = {-1, -1, -1, -1};
+
+    bool operator==(const SDMABUFImportKey& other) const = default;
+};
+
+struct SDMABUFImportKeyHash {
+    size_t operator()(const SDMABUFImportKey& key) const {
+        size_t seed = 0;
+        auto   combine = [&](const auto value) {
+            seed ^= std::hash<std::decay_t<decltype(value)>>{}(value) + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+        };
+
+        combine(key.buffer);
+        combine(key.width);
+        combine(key.height);
+        combine(key.format);
+        combine(key.modifier);
+        combine(key.planes);
+
+        for (int i = 0; i < key.planes; ++i) {
+            combine(key.offsets[i]);
+            combine(key.strides[i]);
+            combine(key.fds[i]);
+        }
+
+        return seed;
+    }
+};
+
+static std::unordered_set<SDMABUFImportKey, SDMABUFImportKeyHash> g_importableDMABUFs;
+static constexpr size_t                                          MAX_IMPORT_CACHE_SIZE = 512;
 
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
     return HYPRLAND_API_VERSION;
@@ -25,6 +74,7 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
 
 typedef bool (*origNeedsUnmodifiedCopy)(void*);
 typedef void (*origSaveBufferForMirror)(void*, const CBox&);
+typedef SP<Render::IRenderbuffer> (*origGetOrCreateRenderbuffer)(void*, SP<Aquamarine::IBuffer>, uint32_t);
 
 static constexpr float CAPTURE_EXPOSURE_AT_REF_LUMINANCE = 0.78125F;
 static constexpr float CAPTURE_REFERENCE_LUMINANCE       = 80.0F;
@@ -51,6 +101,54 @@ static bool hkNeedsUnmodifiedCopy(void* thisptr) {
         return false;
 
     return ((origNeedsUnmodifiedCopy)g_needsUnmodifiedCopyHook->m_original)(thisptr);
+}
+
+static bool canImportDMABUFForRenderbuffer(const SP<Aquamarine::IBuffer>& buffer) {
+    if (!buffer || !Render::GL::g_pHyprOpenGL)
+        return false;
+
+    const auto attrs = buffer->dmabuf();
+    if (!attrs.success || attrs.size.x <= 0 || attrs.size.y <= 0 || attrs.format == 0 || attrs.planes < 1 || attrs.planes > 4)
+        return false;
+
+    for (int i = 0; i < attrs.planes; ++i) {
+        if (attrs.fds[i] < 0 || attrs.strides[i] == 0)
+            return false;
+    }
+
+    const SDMABUFImportKey key = {
+        .buffer   = reinterpret_cast<uintptr_t>(buffer.get()),
+        .width    = static_cast<int>(attrs.size.x),
+        .height   = static_cast<int>(attrs.size.y),
+        .format   = attrs.format,
+        .modifier = attrs.modifier,
+        .planes   = attrs.planes,
+        .offsets  = attrs.offsets,
+        .strides  = attrs.strides,
+        .fds      = attrs.fds,
+    };
+
+    if (g_importableDMABUFs.contains(key))
+        return true;
+
+    const auto image = Render::GL::g_pHyprOpenGL->createEGLImage(attrs);
+    if (image == EGL_NO_IMAGE_KHR)
+        return false;
+
+    Render::GL::g_pHyprOpenGL->m_proc.eglDestroyImageKHR(Render::GL::g_pHyprOpenGL->m_eglDisplay, image);
+
+    if (g_importableDMABUFs.size() >= MAX_IMPORT_CACHE_SIZE)
+        g_importableDMABUFs.clear();
+
+    g_importableDMABUFs.emplace(key);
+    return true;
+}
+
+static SP<Render::IRenderbuffer> hkGetOrCreateRenderbuffer(void* thisptr, SP<Aquamarine::IBuffer> buffer, uint32_t fmt) {
+    if (!canImportDMABUFForRenderbuffer(buffer))
+        return nullptr;
+
+    return ((origGetOrCreateRenderbuffer)g_getOrCreateRBHook->m_original)(thisptr, buffer, fmt);
 }
 
 static NColorManagement::PImageDescription captureImageDescription() {
@@ -129,10 +227,12 @@ void main() {
 }
 
 static bool renderCaptureShader(const SP<Render::ITexture>& sourceTex, const SP<Render::IFramebuffer>& mirrorFB, const CBox& box, const float exposure, const float blackLift, const float inverseSdrBrightness, const float inverseSdrSaturation) {
-    if (!sourceTex || !mirrorFB || !ensureCaptureShader())
+    if (!g_pHyprRenderer || !Render::GL::g_pHyprOpenGL || !sourceTex || !mirrorFB || !ensureCaptureShader())
         return false;
 
     auto guard = g_pHyprRenderer->bindTempFB(mirrorFB);
+    if (!guard)
+        return false;
 
     Render::GL::g_pHyprOpenGL->blend(false);
 
@@ -184,8 +284,14 @@ static void hkSaveBufferForMirror(void* thisptr, const CBox& box) {
         return;
     }
 
-    const auto sourceTex = g_pHyprRenderer && g_pHyprRenderer->m_renderData.currentFB ? g_pHyprRenderer->m_renderData.currentFB->getTexture() : nullptr;
-    const auto mirrorFB  = monitor && monitor->resources() ? monitor->resources()->mirrorFB() : nullptr;
+    const auto resources = monitor->resources();
+    if (!resources || !g_pHyprRenderer || !g_pHyprRenderer->m_renderData.currentFB)
+        return;
+
+    const auto sourceTex = resources->m_mirrorTex ? resources->m_mirrorTex : g_pHyprRenderer->m_renderData.currentFB->getTexture();
+    const auto mirrorFB  = resources->mirrorFB();
+    if (!sourceTex || !mirrorFB)
+        return;
 
     if (mirrorFB)
         mirrorFB->setImageDescription(captureImageDescription());
@@ -199,8 +305,6 @@ static void hkSaveBufferForMirror(void* thisptr, const CBox& box) {
 
     if (renderCaptureShader(sourceTex, mirrorFB, box, exposure, blackLift, inverseSdrBrightness, inverseSdrSaturation))
         return;
-
-    ((origSaveBufferForMirror)g_saveBufferForMirrorHook->m_original)(thisptr, box);
 }
 
 static void* findFnOrThrow(const std::string& name, std::initializer_list<std::string_view> demangledNeedles) {
@@ -256,6 +360,14 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!g_saveBufferForMirrorHook || !g_saveBufferForMirrorHook->hook())
         throw std::runtime_error("[fix-hdr-screenshare] Failed to hook CHyprOpenGLImpl::saveBufferForMirror");
 
+    g_getOrCreateRBHook = HyprlandAPI::createFunctionHook(
+        g_pluginHandle,
+        findFnOrThrow("getOrCreateRenderbuffer", {"Render::IHyprRenderer::getOrCreateRenderbuffer("}),
+        (void*)hkGetOrCreateRenderbuffer);
+
+    if (!g_getOrCreateRBHook || !g_getOrCreateRBHook->hook())
+        throw std::runtime_error("[fix-hdr-screenshare] Failed to hook Render::IHyprRenderer::getOrCreateRenderbuffer");
+
     scheduleRefreshForAllMonitors();
 
     return {"fix-hdr-screenshare", "Disable the HDR unmodified-copy MRT path used for screenshare", "daniel", "0.4"};
@@ -276,6 +388,13 @@ APICALL EXPORT void PLUGIN_EXIT() {
         g_saveBufferForMirrorHook = nullptr;
     }
 
+    if (g_getOrCreateRBHook) {
+        g_getOrCreateRBHook->unhook();
+        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_getOrCreateRBHook);
+        g_getOrCreateRBHook = nullptr;
+    }
+
+    g_importableDMABUFs.clear();
     g_captureShader.reset();
 
     scheduleRefreshForAllMonitors();
