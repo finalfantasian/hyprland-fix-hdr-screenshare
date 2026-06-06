@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <format>
 #include <functional>
@@ -24,6 +25,8 @@ static HANDLE         g_pluginHandle             = nullptr;
 static CFunctionHook* g_needsUnmodifiedCopyHook  = nullptr;
 static CFunctionHook* g_saveBufferForMirrorHook  = nullptr;
 static CFunctionHook* g_getOrCreateRBHook        = nullptr;
+static CFunctionHook* g_blurFramebufferHook      = nullptr;
+static CFunctionHook* g_renderTextureHook        = nullptr;
 static bool           g_disableUnmodifiedCopyMRT = true;
 static SP<CShader>     g_captureShader;
 
@@ -67,6 +70,7 @@ struct SDMABUFImportKeyHash {
 
 static std::unordered_set<SDMABUFImportKey, SDMABUFImportKeyHash> g_importableDMABUFs;
 static constexpr size_t                                          MAX_IMPORT_CACHE_SIZE = 512;
+static std::unordered_set<uintptr_t>                             g_srgbBlurTextures;
 
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
     return HYPRLAND_API_VERSION;
@@ -75,6 +79,8 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
 typedef bool (*origNeedsUnmodifiedCopy)(void*);
 typedef void (*origSaveBufferForMirror)(void*, const CBox&);
 typedef SP<Render::IRenderbuffer> (*origGetOrCreateRenderbuffer)(void*, SP<Aquamarine::IBuffer>, uint32_t);
+typedef SP<Render::ITexture> (*origBlurFramebuffer)(void*, SP<Render::IFramebuffer>, float, CRegion*);
+typedef void (*origRenderTextureInternal)(void*, SP<Render::ITexture>, const CBox&, const Render::GL::CHyprOpenGLImpl::STextureRenderData&);
 
 static constexpr float CAPTURE_EXPOSURE_AT_REF_LUMINANCE = 0.78125F;
 static constexpr float CAPTURE_REFERENCE_LUMINANCE       = 80.0F;
@@ -153,6 +159,48 @@ static SP<Render::IRenderbuffer> hkGetOrCreateRenderbuffer(void* thisptr, SP<Aqu
 
 static NColorManagement::PImageDescription captureImageDescription() {
     return NColorManagement::DEFAULT_SRGB_IMAGE_DESCRIPTION;
+}
+
+static bool ensureCaptureShader();
+static SP<Render::ITexture> renderSDRBlurFromHDRSource(const SP<Render::IFramebuffer>& source, float a, CRegion* originalDamage);
+
+static bool currentMonitorInHDR() {
+    const auto monitorRef = g_pHyprRenderer ? g_pHyprRenderer->m_renderData.pMonitor : PHLMONITORREF{};
+    const auto monitor    = monitorRef ? monitorRef.lock() : PHLMONITOR{};
+    return monitor && monitor->inHDR();
+}
+
+static PHLMONITOR currentMonitor() {
+    const auto monitorRef = g_pHyprRenderer ? g_pHyprRenderer->m_renderData.pMonitor : PHLMONITORREF{};
+    return monitorRef ? monitorRef.lock() : PHLMONITOR{};
+}
+
+static SP<Render::ITexture> hkBlurFramebuffer(void* thisptr, SP<Render::IFramebuffer> source, float a, CRegion* originalDamage) {
+    auto tex = currentMonitorInHDR() ? renderSDRBlurFromHDRSource(source, a, originalDamage) : nullptr;
+    if (!tex)
+        tex = ((origBlurFramebuffer)g_blurFramebufferHook->m_original)(thisptr, source, a, originalDamage);
+
+    if (currentMonitorInHDR() && tex)
+        g_srgbBlurTextures.emplace(reinterpret_cast<uintptr_t>(tex.get()));
+
+    return tex;
+}
+
+static void hkRenderTextureInternal(void* thisptr, SP<Render::ITexture> tex, const CBox& box, const Render::GL::CHyprOpenGLImpl::STextureRenderData& data) {
+    const auto key          = reinterpret_cast<uintptr_t>(tex.get());
+    const auto monitor      = currentMonitor();
+    const bool relabelBlur  = monitor && monitor->inHDR() && tex && g_srgbBlurTextures.contains(key);
+    const auto originalDesc = relabelBlur ? tex->m_imageDescription : NColorManagement::PImageDescription{};
+
+    if (relabelBlur)
+        tex->m_imageDescription = NColorManagement::DEFAULT_SRGB_IMAGE_DESCRIPTION;
+
+    ((origRenderTextureInternal)g_renderTextureHook->m_original)(thisptr, tex, box, data);
+
+    if (relabelBlur) {
+        tex->m_imageDescription = originalDesc;
+        g_srgbBlurTextures.erase(key);
+    }
 }
 
 static bool ensureCaptureShader() {
@@ -275,6 +323,198 @@ static bool renderCaptureShader(const SP<Render::ITexture>& sourceTex, const SP<
     return true;
 }
 
+static bool renderCaptureShaderToFB(const SP<Render::ITexture>& sourceTex,
+                                    const SP<Render::IFramebuffer>& targetFB,
+                                    const Mat3x3& matrix,
+                                    const CRegion& damage,
+                                    const float exposure,
+                                    const float blackLift,
+                                    const float inverseSdrBrightness,
+                                    const float inverseSdrSaturation) {
+    if (!g_pHyprRenderer || !Render::GL::g_pHyprOpenGL || !sourceTex || !targetFB || !ensureCaptureShader())
+        return false;
+
+    auto guard = g_pHyprRenderer->bindTempFB(targetFB);
+    if (!guard)
+        return false;
+
+    dc<Render::GL::CGLFramebuffer*>(targetFB.get())->clearAfterInvalidation();
+
+    glActiveTexture(GL_TEXTURE0);
+    sourceTex->bind();
+    sourceTex->setTexParameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    sourceTex->setTexParameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    sourceTex->setTexParameter(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    sourceTex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+    auto shader = Render::GL::g_pHyprOpenGL->useShader(g_captureShader);
+    shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, matrix.getMatrix());
+    shader->setUniformInt(SHADER_TEX, 0);
+    glUniform1f(glGetUniformLocation(shader->program(), "exposure"), exposure);
+    glUniform1f(glGetUniformLocation(shader->program(), "saturation"), CAPTURE_SATURATION);
+    glUniform1f(glGetUniformLocation(shader->program(), "blackLift"), blackLift);
+    glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrBrightness"), inverseSdrBrightness);
+    glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrSaturation"), inverseSdrSaturation);
+
+    glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
+    glBindBuffer(GL_ARRAY_BUFFER, shader->getUniformLocation(SHADER_SHADER_VBO));
+    glBufferData(GL_ARRAY_BUFFER, sizeof(Render::GL::fullVerts), nullptr, GL_DYNAMIC_DRAW);
+
+    auto verts = Render::GL::fullVerts;
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts.data());
+
+    if (!damage.empty()) {
+        damage.forEachRect([](const auto& rect) {
+            Render::GL::g_pHyprOpenGL->scissor(&rect, false);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        });
+    }
+
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    sourceTex->unbind();
+    Render::GL::g_pHyprOpenGL->scissor(nullptr);
+
+    return true;
+}
+
+static SP<Render::ITexture> renderSDRBlurFromHDRSource(const SP<Render::IFramebuffer>& source, float a, CRegion* originalDamage) {
+    if (!g_pHyprRenderer || !Render::GL::g_pHyprOpenGL || !source || !source->getTexture() || !originalDamage)
+        return nullptr;
+
+    const auto monitor = currentMonitor();
+    if (!monitor || !monitor->inHDR())
+        return nullptr;
+
+    const auto resources = monitor->resources();
+    if (!resources)
+        return nullptr;
+
+    const auto blurFB     = resources->getUnusedWorkBuffer();
+    const auto blurSwapFB = resources->getUnusedWorkBuffer();
+    if (!blurFB || !blurSwapFB || blurFB == blurSwapFB)
+        return nullptr;
+
+    static auto PBLURSIZE             = CConfigValue<Config::INTEGER>("decoration:blur:size");
+    static auto PBLURPASSES           = CConfigValue<Config::INTEGER>("decoration:blur:passes");
+    static auto PBLURVIBRANCY         = CConfigValue<Config::FLOAT>("decoration:blur:vibrancy");
+    static auto PBLURVIBRANCYDARKNESS = CConfigValue<Config::FLOAT>("decoration:blur:vibrancy_darkness");
+    static auto PBLURNOISE            = CConfigValue<Config::FLOAT>("decoration:blur:noise");
+    static auto PBLURBRIGHTNESS       = CConfigValue<Config::FLOAT>("decoration:blur:brightness");
+
+    const auto TRANSFORM  = Math::wlTransformToHyprutils(Math::invertTransform(monitor->m_transform));
+    CBox       monitorBox = {0, 0, monitor->m_transformedSize.x, monitor->m_transformedSize.y};
+    const auto glMatrix   = g_pHyprRenderer->projectBoxToTarget(monitorBox, TRANSFORM);
+
+    const auto blurPasses = std::clamp(*PBLURPASSES, sc<int64_t>(1), sc<int64_t>(8));
+    CRegion   damage{*originalDamage};
+    damage.transform(TRANSFORM, monitor->m_transformedSize.x, monitor->m_transformedSize.y);
+    damage.expand(std::clamp(*PBLURSIZE, sc<int64_t>(1), sc<int64_t>(40)) * std::pow(2, blurPasses));
+
+    const float sdrMaxLuminance = std::max<float>(1.0F, monitor->m_sdrMaxLuminance);
+    const float sdrMinLuminance = std::max<float>(0.0F, monitor->m_sdrMinLuminance);
+    const float exposure             = CAPTURE_EXPOSURE_AT_REF_LUMINANCE * CAPTURE_REFERENCE_LUMINANCE / sdrMaxLuminance;
+    const float blackLift            = sdrMinLuminance / CAPTURE_REFERENCE_LUMINANCE;
+    const float inverseSdrBrightness = monitor->m_sdrBrightness > 0.0F ? 1.0F / monitor->m_sdrBrightness : 1.0F;
+    const float inverseSdrSaturation = monitor->m_sdrSaturation > 0.0F ? 1.0F / monitor->m_sdrSaturation : 1.0F;
+
+    const bool blendWasEnabled = glIsEnabled(GL_BLEND);
+    Render::GL::g_pHyprOpenGL->blend(false);
+    Render::GL::g_pHyprOpenGL->setCapStatus(GL_STENCIL_TEST, false);
+
+    if (!renderCaptureShaderToFB(source->getTexture(), blurSwapFB, glMatrix, damage, exposure, blackLift, inverseSdrBrightness, inverseSdrSaturation)) {
+        Render::GL::g_pHyprOpenGL->blend(blendWasEnabled);
+        return nullptr;
+    }
+
+    auto currentRenderToFB = blurSwapFB;
+
+    auto drawPass = [&](WP<CShader> shader, Render::ePreparedFragmentShader frag, CRegion* passDamage) {
+        if (currentRenderToFB == blurFB)
+            blurSwapFB->bind();
+        else
+            blurFB->bind();
+
+        glActiveTexture(GL_TEXTURE0);
+        auto currentTex = currentRenderToFB->getTexture();
+        currentTex->bind();
+        currentTex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+        shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, glMatrix.getMatrix());
+        shader->setUniformFloat(SHADER_RADIUS, *PBLURSIZE * a);
+        if (frag == Render::SH_FRAG_BLUR1) {
+            shader->setUniformFloat2(SHADER_HALFPIXEL, 0.5F / (monitor->m_pixelSize.x / 2.F), 0.5F / (monitor->m_pixelSize.y / 2.F));
+            shader->setUniformInt(SHADER_PASSES, blurPasses);
+            shader->setUniformFloat(SHADER_VIBRANCY, *PBLURVIBRANCY);
+            shader->setUniformFloat(SHADER_VIBRANCY_DARKNESS, *PBLURVIBRANCYDARKNESS);
+        } else
+            shader->setUniformFloat2(SHADER_HALFPIXEL, 0.5F / (monitor->m_pixelSize.x * 2.F), 0.5F / (monitor->m_pixelSize.y * 2.F));
+        shader->setUniformInt(SHADER_TEX, 0);
+
+        glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
+
+        if (!passDamage->empty()) {
+            passDamage->forEachRect([](const auto& rect) {
+                Render::GL::g_pHyprOpenGL->scissor(&rect, false);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            });
+        }
+
+        glBindVertexArray(0);
+
+        currentRenderToFB = currentRenderToFB == blurFB ? blurSwapFB : blurFB;
+    };
+
+    CRegion tempDamage{damage};
+
+    blurFB->bind();
+    dc<Render::GL::CGLFramebuffer*>(blurFB.get())->clearAfterInvalidation();
+
+    auto shader = Render::GL::g_pHyprOpenGL->useShader(Render::GL::g_pHyprOpenGL->getShaderVariant(Render::SH_FRAG_BLUR1));
+    for (auto i = 1; i <= blurPasses; ++i) {
+        tempDamage = damage.copy().scale(1.F / (1 << i));
+        drawPass(shader, Render::SH_FRAG_BLUR1, &tempDamage);
+    }
+
+    shader = Render::GL::g_pHyprOpenGL->useShader(Render::GL::g_pHyprOpenGL->getShaderVariant(Render::SH_FRAG_BLUR2));
+    for (auto i = blurPasses - 1; i >= 0; --i) {
+        tempDamage = damage.copy().scale(1.F / (1 << i));
+        drawPass(shader, Render::SH_FRAG_BLUR2, &tempDamage);
+    }
+
+    if (currentRenderToFB == blurFB)
+        blurSwapFB->bind();
+    else
+        blurFB->bind();
+
+    glActiveTexture(GL_TEXTURE0);
+    auto currentTex = currentRenderToFB->getTexture();
+    currentTex->bind();
+    currentTex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+    shader = Render::GL::g_pHyprOpenGL->useShader(Render::GL::g_pHyprOpenGL->getShaderVariant(Render::SH_FRAG_BLURFINISH));
+    shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, glMatrix.getMatrix());
+    shader->setUniformFloat(SHADER_NOISE, *PBLURNOISE);
+    shader->setUniformFloat(SHADER_BRIGHTNESS, *PBLURBRIGHTNESS);
+    shader->setUniformInt(SHADER_TEX, 0);
+
+    glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
+    if (!damage.empty()) {
+        damage.forEachRect([](const auto& rect) {
+            Render::GL::g_pHyprOpenGL->scissor(&rect, false);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        });
+    }
+    glBindVertexArray(0);
+
+    currentRenderToFB = currentRenderToFB == blurFB ? blurSwapFB : blurFB;
+    Render::GL::g_pHyprOpenGL->scissor(nullptr);
+    currentTex->unbind();
+    Render::GL::g_pHyprOpenGL->blend(blendWasEnabled);
+
+    return currentRenderToFB->getTexture();
+}
+
 static void hkSaveBufferForMirror(void* thisptr, const CBox& box) {
     const auto monitorRef = g_pHyprRenderer ? g_pHyprRenderer->m_renderData.pMonitor : PHLMONITORREF{};
     const auto monitor    = monitorRef ? monitorRef.lock() : PHLMONITOR{};
@@ -368,6 +608,22 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!g_getOrCreateRBHook || !g_getOrCreateRBHook->hook())
         throw std::runtime_error("[fix-hdr-screenshare] Failed to hook Render::IHyprRenderer::getOrCreateRenderbuffer");
 
+    g_blurFramebufferHook = HyprlandAPI::createFunctionHook(
+        g_pluginHandle,
+        findFnOrThrow("blurFramebuffer", {"CHyprGLRenderer::blurFramebuffer("}),
+        (void*)hkBlurFramebuffer);
+
+    if (!g_blurFramebufferHook || !g_blurFramebufferHook->hook())
+        throw std::runtime_error("[fix-hdr-screenshare] Failed to hook CHyprGLRenderer::blurFramebuffer");
+
+    g_renderTextureHook = HyprlandAPI::createFunctionHook(
+        g_pluginHandle,
+        findFnOrThrow("renderTextureInternal", {"CHyprOpenGLImpl::renderTextureInternal("}),
+        (void*)hkRenderTextureInternal);
+
+    if (!g_renderTextureHook || !g_renderTextureHook->hook())
+        throw std::runtime_error("[fix-hdr-screenshare] Failed to hook CHyprOpenGLImpl::renderTextureInternal");
+
     scheduleRefreshForAllMonitors();
 
     return {"fix-hdr-screenshare", "Disable the HDR unmodified-copy MRT path used for screenshare", "daniel", "0.4"};
@@ -394,7 +650,20 @@ APICALL EXPORT void PLUGIN_EXIT() {
         g_getOrCreateRBHook = nullptr;
     }
 
+    if (g_blurFramebufferHook) {
+        g_blurFramebufferHook->unhook();
+        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_blurFramebufferHook);
+        g_blurFramebufferHook = nullptr;
+    }
+
+    if (g_renderTextureHook) {
+        g_renderTextureHook->unhook();
+        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_renderTextureHook);
+        g_renderTextureHook = nullptr;
+    }
+
     g_importableDMABUFs.clear();
+    g_srgbBlurTextures.clear();
     g_captureShader.reset();
 
     scheduleRefreshForAllMonitors();
