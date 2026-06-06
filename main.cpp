@@ -35,6 +35,7 @@ static CFunctionHook* g_preDrawSurfaceHook       = nullptr;
 static CFunctionHook* g_getShaderVariantHook     = nullptr;
 static bool           g_disableUnmodifiedCopyMRT = true;
 static SP<CShader>     g_captureShader;
+static std::unordered_set<uintptr_t> g_scalarAlphaCorrectionTextures;
 static std::unordered_set<uintptr_t> g_alphaCorrectionTextures;
 static std::unordered_map<Render::ShaderFeatureFlags, SP<CShader>> g_alphaCorrectionSurfaceShaders;
 static bool           g_correctSurfaceAlphaShader = false;
@@ -249,22 +250,22 @@ static void hkPreDrawSurface(void* thisptr, WP<CSurfacePassElement> element, con
         }
     }
 
-    const float originalAlpha = element->m_data.alpha;
+    const bool  correctScalarAlpha  = tex && totalAlpha > 0.0F && totalAlpha < 1.0F;
     const bool  correctTextureAlpha = tex && tex->m_type == Render::TEXTURE_RGBA && !tex->m_opaque && totalAlpha >= 0.999F;
     const auto  textureKey = correctTextureAlpha ? reinterpret_cast<uintptr_t>(tex.get()) : 0;
+    const auto  scalarTextureKey = correctScalarAlpha ? reinterpret_cast<uintptr_t>(tex.get()) : 0;
 
+    if (correctScalarAlpha)
+        g_scalarAlphaCorrectionTextures.emplace(scalarTextureKey);
     if (correctTextureAlpha)
         g_alphaCorrectionTextures.emplace(textureKey);
-
-    if (totalAlpha > 0.0F && totalAlpha < 1.0F)
-        element->m_data.alpha *= correctedTotalAlpha / totalAlpha;
 
     ((origPreDrawSurface)g_preDrawSurfaceHook->m_original)(thisptr, element, damage);
 
     if (correctTextureAlpha)
         g_alphaCorrectionTextures.erase(textureKey);
-
-    element->m_data.alpha = originalAlpha;
+    if (correctScalarAlpha)
+        g_scalarAlphaCorrectionTextures.erase(scalarTextureKey);
 }
 
 static WP<CShader> hkGetShaderVariant(void* thisptr, Render::ePreparedFragmentShader frag, Render::ShaderFeatureFlags features) {
@@ -302,14 +303,20 @@ static void hkRenderTextureInternal(void* thisptr, SP<Render::ITexture> tex, con
     const auto monitor      = currentMonitor();
     const bool relabelBlur  = monitor && monitor->inHDR() && tex && g_srgbBlurTextures.contains(key);
     const auto originalDesc = relabelBlur ? tex->m_imageDescription : NColorManagement::PImageDescription{};
-    const bool correctAlpha = monitor && monitor->inHDR() && !relabelBlur && g_alphaCorrectionTextures.contains(key);
+    const bool correctTextureAlpha = monitor && monitor->inHDR() && !relabelBlur && !data.discardActive && g_alphaCorrectionTextures.contains(key);
+    const bool correctScalarAlpha =
+        monitor && monitor->inHDR() && !relabelBlur && !data.discardActive && g_scalarAlphaCorrectionTextures.contains(key) && data.a > 0.0F && data.a < 1.0F;
     const bool previousCorrectSurfaceAlphaShader = g_correctSurfaceAlphaShader;
+    auto       correctedData = data;
 
     if (relabelBlur)
         tex->m_imageDescription = NColorManagement::DEFAULT_SRGB_IMAGE_DESCRIPTION;
 
-    g_correctSurfaceAlphaShader = correctAlpha;
-    ((origRenderTextureInternal)g_renderTextureHook->m_original)(thisptr, tex, box, data);
+    if (correctScalarAlpha)
+        correctedData.a = correctHDRAlpha(data.a);
+
+    g_correctSurfaceAlphaShader = correctTextureAlpha;
+    ((origRenderTextureInternal)g_renderTextureHook->m_original)(thisptr, tex, box, correctedData);
     g_correctSurfaceAlphaShader = previousCorrectSurfaceAlphaShader;
 
     if (relabelBlur) {
@@ -807,6 +814,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
 
     g_importableDMABUFs.clear();
     g_srgbBlurTextures.clear();
+    g_scalarAlphaCorrectionTextures.clear();
     g_alphaCorrectionTextures.clear();
     g_alphaCorrectionSurfaceShaders.clear();
     g_surfaceDebugTimers.clear();
