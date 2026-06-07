@@ -342,6 +342,8 @@ uniform float saturation;
 uniform float blackLift;
 uniform float inverseSdrBrightness;
 uniform float inverseSdrSaturation;
+uniform float contrast;
+uniform float brightness;
 layout(location = 0) out vec4 fragColor;
 
 vec3 acesApprox(vec3 v) {
@@ -365,6 +367,14 @@ vec3 applySaturation(vec3 color, float saturation) {
     return mix(vec3(y), color, saturation);
 }
 
+vec3 gain(vec3 src, float k) {
+    vec3 x = clamp(src, 0.0, 1.0);
+    vec3 t = step(0.5, x);
+    vec3 y = mix(x, 1.0 - x, t);
+    vec3 a = 0.5 * pow(2.0 * y, vec3(k));
+    return mix(a, 1.0 - a, t);
+}
+
 void main() {
     vec4 src = texture(tex, v_texcoord);
     vec3 rgb = max(src.rgb, vec3(0.0));
@@ -382,6 +392,10 @@ void main() {
     rgb += vec3(blackLift) * shadowMask;
 
     rgb = linearToSrgb(clamp(rgb, 0.0, 1.0));
+
+    if (contrast != 1.0)
+        rgb = gain(rgb, contrast);
+    rgb *= max(1.0, brightness);
 
     fragColor = vec4(rgb, 1.0);
 }
@@ -423,6 +437,8 @@ static bool renderCaptureShader(const SP<Render::ITexture>& sourceTex, const SP<
     glUniform1f(glGetUniformLocation(shader->program(), "blackLift"), blackLift);
     glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrBrightness"), inverseSdrBrightness);
     glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrSaturation"), inverseSdrSaturation);
+    glUniform1f(glGetUniformLocation(shader->program(), "contrast"), 1.0F);
+    glUniform1f(glGetUniformLocation(shader->program(), "brightness"), 1.0F);
 
     glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
     glBindBuffer(GL_ARRAY_BUFFER, shader->getUniformLocation(SHADER_SHADER_VBO));
@@ -452,7 +468,9 @@ static bool renderCaptureShaderToFB(const SP<Render::ITexture>& sourceTex,
                                     const float exposure,
                                     const float blackLift,
                                     const float inverseSdrBrightness,
-                                    const float inverseSdrSaturation) {
+                                    const float inverseSdrSaturation,
+                                    const float contrast,
+                                    const float brightness) {
     if (!g_pHyprRenderer || !Render::GL::g_pHyprOpenGL || !sourceTex || !targetFB || !ensureCaptureShader())
         return false;
 
@@ -477,6 +495,8 @@ static bool renderCaptureShaderToFB(const SP<Render::ITexture>& sourceTex,
     glUniform1f(glGetUniformLocation(shader->program(), "blackLift"), blackLift);
     glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrBrightness"), inverseSdrBrightness);
     glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrSaturation"), inverseSdrSaturation);
+    glUniform1f(glGetUniformLocation(shader->program(), "contrast"), contrast);
+    glUniform1f(glGetUniformLocation(shader->program(), "brightness"), brightness);
 
     glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
     glBindBuffer(GL_ARRAY_BUFFER, shader->getUniformLocation(SHADER_SHADER_VBO));
@@ -521,6 +541,7 @@ static SP<Render::ITexture> renderSDRBlurFromHDRSource(const SP<Render::IFramebu
     static auto PBLURPASSES           = CConfigValue<Config::INTEGER>("decoration:blur:passes");
     static auto PBLURVIBRANCY         = CConfigValue<Config::FLOAT>("decoration:blur:vibrancy");
     static auto PBLURVIBRANCYDARKNESS = CConfigValue<Config::FLOAT>("decoration:blur:vibrancy_darkness");
+    static auto PBLURCONTRAST         = CConfigValue<Config::FLOAT>("decoration:blur:contrast");
     static auto PBLURNOISE            = CConfigValue<Config::FLOAT>("decoration:blur:noise");
     static auto PBLURBRIGHTNESS       = CConfigValue<Config::FLOAT>("decoration:blur:brightness");
 
@@ -544,7 +565,8 @@ static SP<Render::ITexture> renderSDRBlurFromHDRSource(const SP<Render::IFramebu
     Render::GL::g_pHyprOpenGL->blend(false);
     Render::GL::g_pHyprOpenGL->setCapStatus(GL_STENCIL_TEST, false);
 
-    if (!renderCaptureShaderToFB(source->getTexture(), blurSwapFB, glMatrix, damage, exposure, blackLift, inverseSdrBrightness, inverseSdrSaturation)) {
+    if (!renderCaptureShaderToFB(source->getTexture(), blurSwapFB, glMatrix, damage, exposure, blackLift, inverseSdrBrightness, inverseSdrSaturation, *PBLURCONTRAST,
+                                 *PBLURBRIGHTNESS)) {
         Render::GL::g_pHyprOpenGL->blend(blendWasEnabled);
         return nullptr;
     }
