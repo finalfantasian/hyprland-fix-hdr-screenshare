@@ -10,6 +10,6 @@ description = "Disable the HDR unmodified-copy MRT path used for screenshare"
 authors = ["Me"]
 output = "fix-hdr-screenshare.so"
 build = [
-    "make"
+    "make all"
 ]
 
