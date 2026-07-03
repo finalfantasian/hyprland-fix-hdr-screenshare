@@ -2,7 +2,6 @@
 name = "hyprland-fix-hdr-screenshare"
 authors = ["Me"]
 
-[hyprland]
 plugins = ["fix-hdr-screenshare"]
 
 [fix-hdr-screenshare]
