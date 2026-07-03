@@ -1,12 +1,7 @@
 [repository]
 name = "hyprland-fix-hdr-screenshare"
 authors = ["daniel"]
-commit_pins = [
-    # Hyprland                                  hyprland-fix-hdr-screenshare
-    ["14fa1fd0273973b7a40966b4fa9e081d6bf67dae", "db870de405f9deee8b778271745ca4674c852ae1"], # v0.55.0
-]
 
-[hyprland]
 plugins = ["fix-hdr-screenshare"]
 
 [fix-hdr-screenshare]
