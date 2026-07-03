@@ -1,14 +1,15 @@
 [repository]
 name = "hyprland-fix-hdr-screenshare"
-authors = ["daniel"]
+authors = ["Me"]
 
 [hyprland]
 plugins = ["fix-hdr-screenshare"]
 
 [fix-hdr-screenshare]
 description = "Disable the HDR unmodified-copy MRT path used for screenshare"
-authors = ["daniel"]
+authors = ["Me"]
 output = "fix-hdr-screenshare.so"
 build = [
     "make"
 ]
+
